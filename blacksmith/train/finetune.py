@@ -1,10 +1,11 @@
 import time
 from io import BytesIO
+import asyncio
 
 from dataclasses import dataclass
 from typing import Optional, List
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 from openai.types import FileObject
 from openai.types.fine_tuning import FineTuningJob
 
@@ -113,11 +114,11 @@ Here are the prompts and data:
 
     def __init__(self):
         self.data = JsonLData()
-        self.client = OpenAI()
+        self.client = AsyncOpenAI()
 
-    def generate_from_text(self, model_query: str, data_query: str, data: str):
+    async def generate_from_text(self, model_query: str, data_query: str, data: str):
         prompt = f"{self.QA_PROMPT}\nModel Query: \"{model_query}\"\nData Query: \"{data_query}\"\nData: \"{data}\"\n"
-        response = self.client.chat.completions.create(
+        response = await self.client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "user", "content": prompt},
@@ -141,35 +142,35 @@ class MistralModel:
 
 @dataclass
 class GptModel:
-    client: OpenAI
+    client: AsyncOpenAI
     ft_id: Optional[str] = None
     ft_name: Optional[str] = None
 
     def __init__(self):
-        self.client = OpenAI()
+        self.client = AsyncOpenAI()
         self.name = "gpt-4o-mini-2024-07-18"
 
-    def create_file(self, data_str: str) -> FileObject:
+    async def create_file(self, data_str: str) -> FileObject:
         """Create a file with the given data."""
 
         file = BytesIO(data_str.encode())
 
-        return self.client.files.create(
+        return await self.client.files.create(
             file=file,
             purpose="fine-tune",
         )
 
-    def list_files(self) -> str:
+    async def list_files(self) -> str:
         """List all files."""
-        return self.client.files.list()
+        return await self.client.files.list()
 
-    def get_file_object(self, file_id: str) -> FileObject:
+    async def get_file_object(self, file_id: str) -> FileObject:
         """Get a file by its ID."""
-        return self.client.files.retrieve(file_id)
+        return await self.client.files.retrieve(file_id)
     
-    def get_file_content(self, file_id: str) -> str:
+    async def get_file_content(self, file_id: str) -> str:
         """Get the content of a file."""
-        return self.client.files.content(file_id).text
+        return await self.client.files.content(file_id).text
 
     def delete_file(self, file_id: str) -> None:
         """Delete a file by its ID."""
@@ -185,6 +186,7 @@ class SmithModel:
     model: GptModel | MistralModel
     system_prompt: Optional[str] = None
     jsonl_generator: Optional[JsonLGenerator] = None
+    client: AsyncOpenAI = AsyncOpenAI()
 
     def __init__(self, model: str):
         if model == "gpt":
@@ -192,13 +194,56 @@ class SmithModel:
         elif model == "mistral":
             self.model = MistralModel()
         self.jsonl_generator = JsonLGenerator()
+        self.complete = False
 
-    def finetune_text_model(self, model_query: str, data_query: str, data: str):
+    async def summarize(self):
+        """Summarize the current state of the model."""
+
+        status = await self.get_finetune_status()
+        if status is None:
+            return "Preparing to finetune model..."
+
+        if isinstance(self.model, GptModel):
+            prompt = """
+    You will be provided information about a finetuning model process that is automatically building an ML model. You will be
+    given the following information:
+        1. type of model: The type of model that is being finetuned
+        2. status: The current status of the finetuning process
+
+    Your job is to summarize this information in a way that is easy to understand the stage
+    of the finetuning process. The summary should be only 1 sentence long.
+
+    Example input:
+        type of model: gpt-4o-mini
+        status: validating_files
+
+    Example output:
+        Validating data to finetune the gpt-4o-mini model...
+
+    Here is the current state of the finetuning process:
+    """
+            
+            prompt_info = f"""
+    type of model: {self.model.name}
+    status: {(await self.get_finetune_status()).status}
+    """
+
+            summary = await self.client.chat.completions.create(
+                model="gpt-4o-mini-2024-07-18",
+                messages=[{"role": "user", "content": prompt + prompt_info}]
+            )
+            summary = summary.choices[0].message.content.strip()
+            return summary
+
+        elif isinstance(self.model, MistralModel):
+            return "Mistral model"
+
+    async def finetune_text_model(self, model_query: str, data_query: str, data: str, interactive: bool = False):
         """Finetune a text model with the given data."""
         print("Fine-tuning model...\n")
 
         print("Generating prompts...\n")
-        self.jsonl_generator.generate_from_text(
+        await self.jsonl_generator.generate_from_text(
             model_query=model_query,
             data_query=data_query,
             data=data,
@@ -213,50 +258,54 @@ class SmithModel:
             self.system_prompt = data.prompts[0].system_prompt
             print("System prompt:", self.system_prompt)
             print("Creating GPT files...")
-            file = self.model.create_file(str(data))
+            file = await self.model.create_file(str(data))
 
             print("Fine-tuning model...")
-            ft_job: FineTuningJob = self.model.client.fine_tuning.jobs.create(
+            ft_job: FineTuningJob = await self.model.client.fine_tuning.jobs.create(
                 training_file=file.id,
                 model=self.model.name,
                 hyperparameters={
-                    "n_epochs": 1,
+                    "n_epochs": 7,
                 }
             )
             self.model.ft_id = ft_job.id
 
         while True:
-            ft_job: FineTuningJob = self.get_finetune_status()
-            print("Fine-tuning status:", ft_job.status)
+            ft_job: FineTuningJob = await self.get_finetune_status()
+            print(await self.summarize())
             if ft_job.status == "succeeded":
+                self.complete = True
                 self.model.ft_name = ft_job.fine_tuned_model
                 print(self.model.ft_name)
                 break
             elif ft_job.status == "failed":
+                self.complete = False
                 print("Fine-tuning failed.")
                 return
-            time.sleep(5)
+            await asyncio.sleep(5)
         
         print("Fine-tuning succeeded.\n")
-        user_prompt = input("Enter a prompt: ")
-        print(self.prompt(user_prompt))
+        if interactive:
+            while True:
+                user_prompt = input("Enter a prompt: ")
+                print(await self.prompt(user_prompt))
 
-    def get_finetune_status(self) -> FineTuningJob:
+    async def get_finetune_status(self) -> FineTuningJob:
         """Get the status of the current fine-tuning job."""
         if isinstance(self.model, GptModel):
             if self.model.ft_id is None:
                 return None
-            ft_job: FineTuningJob = self.model.client.fine_tuning.jobs.retrieve(self.model.ft_id)
+            ft_job: FineTuningJob = await self.model.client.fine_tuning.jobs.retrieve(self.model.ft_id)
             return ft_job
 
-    def prompt(self, prompt: str) -> str:
+    async def prompt(self, prompt: str) -> str:
         """Generate a response to the given prompt."""
 
         if self.model.ft_name is None or self.system_prompt is None:
             return "Model not finetuned yet."
 
         if isinstance(self.model, GptModel):
-            return self.model.client.chat.completions.create(
+            return await self.model.client.chat.completions.create(
                 model=self.model.ft_name,
                 messages=[
                     {"role": "system", "content": self.system_prompt},
@@ -291,8 +340,9 @@ JOHN (turning to Sherlock again): Then who said anything about flatmates?
 SHERLOCK (picking up his greatcoat and putting it on): I did. Told Mike this morning that I must be a difficult man to find a flatmate for. Now here he is just after lunch with an old friend, clearly just home from military service in Afghanistan. Wasn’t that difficult a leap.
 """
 
-    model.finetune_text_model(
+    asyncio.run(model.finetune_text_model(
         model_query=model_query,
         data_query=data_query,
         data=data,
-    )
+        interactive=True,
+    ))
