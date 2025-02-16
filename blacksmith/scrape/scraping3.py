@@ -142,8 +142,8 @@ def main():
     options.add_argument("--start-maximized")
     driver = webdriver.Chrome(options=options)
     
-    OPENAI_API_KEY = ""
-    client = OpenAI(organization="", api_key=OPENAI_API_KEY)
+    OPENAI_API_KEY = "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"
+    client = OpenAI(organization="org-kVOVicnzMxUo7zsa1QnMws1F", api_key=OPENAI_API_KEY)
     
     state = AutomationState()
     
