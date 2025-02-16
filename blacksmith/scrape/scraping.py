@@ -1,5 +1,6 @@
 from ..parse import Prompt
 
+import asyncio
 from typing import Literal, Optional, List
 from dataclasses import dataclass
 from openai import AsyncOpenAI
@@ -7,6 +8,10 @@ from selenium import webdriver
 from bs4 import BeautifulSoup
 import time
 from datetime import datetime
+import urllib
+import requests
+import re
+from tqdm import tqdm
 
 class AutomationState:
     def __init__(self):
@@ -138,6 +143,12 @@ class Body:
     timestamp: str
 
 class ContentExtractor:
+    GITHUB_BASE_URL = "https://github.com"
+    GITHUB_RAW_BASE_URL = "https://raw.githubusercontent.com"
+
+    def __init__(self):
+        self.client = AsyncOpenAI()
+
     def extract_headers(self, state: AutomationState, page_url: str, page_source: str) -> Header:
         """Initial quick scan of page - just headers and basic content"""
 
@@ -148,8 +159,12 @@ class ContentExtractor:
         
         return Header(url=page_url, headers=headers)
 
-    def extract_body(self, page_url: str, page_source: str, prompt: Prompt) -> Body:
+    async def extract_body(self, page_url: str, page_source: str, prompt: Prompt) -> Body:
+        if (re.match(r"https://github.com/[^\s]+/[^\s]+", page_url)):
+        # if (page_url.startswith(ContentExtractor.GITHUB_BASE_URL)):
+            return await self.extract_github_content(page_url, prompt)
         soup = BeautifulSoup(page_source, 'html.parser')
+        
         title = soup.find(id="firstHeading").text if soup.find(id="firstHeading") else ""
 
         # Get main content
@@ -170,12 +185,95 @@ class ContentExtractor:
                         main_text=main_text, 
                         timestamp=datetime.now().strftime("%Y%m%d_%H%M%S"))
 
+    async def extract_github_content(self, page_url: str, prompt: Prompt, base_path="", file_type="") -> Body:
+        print("Extracting GitHub content...")
+        def convert_to_raw_link(blob_url):
+            parts = urllib.parse.urlparse(blob_url)
+            path_parts = parts.path.split("/")
+            raw_path = "/".join(path_parts[3:])
+            raw_link = f"{ContentExtractor.GITHUB_RAW_BASE_URL}/{path_parts[1]}/{path_parts[2]}/{raw_path}"
+            return raw_link
+
+        def get_soup(url):
+            headers = {"User-Agent": "Mozilla/5.0"}
+            response = requests.get(url, headers=headers)
+            if response.status_code != 200:
+                print(f"Failed to fetch {url} (Status Code: {response.status_code})")
+                return None
+            return BeautifulSoup(response.text, "html.parser")
+
+        def get_files(repo_url, base_path="", file_types=[]):
+            soup = get_soup(repo_url)
+            if not soup:
+                return []
+
+            files_list = []
+
+            items = soup.select("a.Link--primary[href]")
+
+            for item in tqdm(items):
+                relative_link = item["href"]
+                full_link = ContentExtractor.GITHUB_BASE_URL + relative_link
+
+                if "/tree/" in full_link:  
+                    files_list.extend(get_files(full_link, base_path + "/" + relative_link.split("/")[-1], file_types))
+                elif "/blob/" in full_link:  
+                    raw_file_link = convert_to_raw_link(full_link)
+                    for file_type in file_types:
+                        if (full_link.endswith(file_type)):
+                            files_list.append(raw_file_link)
+
+            return files_list
+
+        file_types = await self.determine_file_extension(prompt)
+        files_list = get_files(page_url, base_path, file_types)
+        main_text = []
+        for file in files_list:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            response = requests.get(file, headers=headers)
+            if response.status_code != 200:
+                print(f"Failed to fetch {file} (Status Code: {response.status_code})")
+                return None
+            cur_soup = BeautifulSoup(response.text, "html.parser")
+            
+            if cur_soup:
+                textarea = cur_soup.find("textarea", {"id": "read-only-cursor-text-area"})
+                if textarea:
+                    main_text.append(textarea.text.strip())
+
+        return Body(url=page_url, 
+                    title=page_url, 
+                    main_text="\n\n".join(main_text), 
+                    timestamp=datetime.now().strftime("%Y%m%d_%H%M%S"))
+
+    async def determine_file_extension(self, prompt: Prompt):
+        print("Determining file extensions...")
+        file_extension_prompt = f"""
+        You will be given a Github repository that contains code that is relevant to adress the user's prompt: 
+        
+        {prompt.webscraping_prompt} 
+        
+        Your job is to determine what file extensions are relevant when scraping all of the files in the repository.
+        Please output your answer in a comma separated list. 
+        
+        Example output: .py,.md
+        """
+        response = await self.client.chat.completions.create(
+            model="gpt-4o-mini-2024-07-18",
+            messages=[{"role": "system", "content": file_extension_prompt}]
+        )
+
+        file_extensions = response.choices[0].message.content.strip().split(",")
+    
+        return file_extensions
+
 class Worker:
     def __init__(self):
         options = webdriver.ChromeOptions()
         options.add_argument("--start-maximized")
         self.driver = webdriver.Chrome(options=options)
         self.client = AsyncOpenAI()
+
 
     def current_url(self):
         return self.driver.current_url
@@ -230,7 +328,7 @@ class Scraper:
         print("Header content:", self.state.header_content)
         if self.thinker.is_relevant(self.state, prompt):
             print("Relevant content found, extracting body")
-            self.state.body_content = self.content_extractor.extract_body(self.state.current_url, 
+            self.state.body_content = await self.content_extractor.extract_body(self.state.current_url, 
                 self.state.page_source, prompt)
         thinking_step: ThinkingStep = await self.thinker.think(self.state, prompt)
         if thinking_step.next_step == "DONE":
@@ -273,9 +371,12 @@ class Scraper:
         if self.worker:
             self.worker.driver.quit()
 
+
 if __name__ == "__main__":
-    prompt = Prompt(webscraping_prompt="Extract the main content from the Wikipedia page on 'Python (programming language)'")
-    scraper = Scraper()
-    scraper.scrape_content(prompt)
-    print(scraper.state.body_content)
-    scraper.close()
+    pass
+    # prompt = Prompt(webscraping_prompt="Extract the main content from the Wikipedia page on 'Python (programming language)'")
+    # prompt = Prompt(webscraping_prompt="Extract the main content from The LOTUS: A Query Engine For Processing Data with LLMs", data_type="text", model_type="gpt-4o-mini-2024-07-18")
+    # scraper = Scraper()
+    # scraper.scrape_content(prompt)
+    # print(scraper.state.body_content)
+    # scraper.close()

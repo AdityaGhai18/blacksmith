@@ -1,4 +1,6 @@
 import time
+from enum import Enum
+import os
 from io import BytesIO
 import asyncio
 
@@ -8,6 +10,8 @@ from typing import Optional, List
 from openai import AsyncOpenAI
 from openai.types import FileObject
 from openai.types.fine_tuning import FineTuningJob
+
+from mistralai import Mistral
 
 @dataclass
 class PromptData:
@@ -77,6 +81,7 @@ Example Function Call:
 The system prompt should be the same for all calls to `generate_question_answer` and should be
 a general prompt based on the Model Query.
 Try to ground the questions and answers with the data that was scraped (quotes, character insights, etc.).
+Do NOT include any newlines in the prompts or data.
 
 Here are the prompts and data:
 """
@@ -138,7 +143,43 @@ Here are the prompts and data:
 
 @dataclass
 class MistralModel:
-    pass
+    client: Mistral
+    ft_id: Optional[str] = None
+    ft_name: Optional[str] = None
+
+    def __init__(self):
+        self.client = Mistral(os.getenv("MISTRAL_API_KEY"))
+        self.name = "open-mistral-7b"
+
+    async def create_file(self, data_str: str) -> FileObject:
+        """Create a file with the given data."""
+
+        file = BytesIO(data_str.encode()).read()
+
+        return await self.client.files.upload_async(
+            file={
+                "file_name": "data.jsonl",
+                "content": file,
+            },
+            purpose="fine-tune",
+        )
+
+    async def list_files(self) -> str:
+        """List all files."""
+        return await self.client.files.list_async()
+
+    async def get_file_object(self, file_id: str) -> FileObject:
+        """Get a file by its ID."""
+        return await self.client.files.retrieve_async(file_id)
+
+    def delete_file(self, file_id: str) -> None:
+        """Delete a file by its ID."""
+        self.client.files.delete(file_id)
+
+    def delete_all_files(self) -> None:
+        """Delete all files."""
+        for file in self.list_files():
+            self.delete_file(file.id)
 
 @dataclass
 class GptModel:
@@ -148,7 +189,7 @@ class GptModel:
 
     def __init__(self):
         self.client = AsyncOpenAI()
-        self.name = "gpt-4o-mini-2024-07-18"
+        self.name = "gpt-3.5-turbo-0125"
 
     async def create_file(self, data_str: str) -> FileObject:
         """Create a file with the given data."""
@@ -181,6 +222,11 @@ class GptModel:
         for file in self.list_files():
             self.delete_file(file.id)
 
+class Status(Enum):
+    PENDING = "pending"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
 @dataclass
 class SmithModel:
     model: GptModel | MistralModel
@@ -203,8 +249,7 @@ class SmithModel:
         if status is None:
             return "Preparing to finetune model..."
 
-        if isinstance(self.model, GptModel):
-            prompt = """
+        prompt = """
     You will be provided information about a finetuning model process that is automatically building an ML model. You will be
     given the following information:
         1. type of model: The type of model that is being finetuned
@@ -223,20 +268,17 @@ class SmithModel:
     Here is the current state of the finetuning process:
     """
             
-            prompt_info = f"""
-    type of model: {self.model.name}
-    status: {(await self.get_finetune_status()).status}
-    """
+        prompt_info = f"""
+type of model: {self.model.name}
+status: {(await self.get_finetune_status()).name}
+"""
 
-            summary = await self.client.chat.completions.create(
-                model="gpt-4o-mini-2024-07-18",
-                messages=[{"role": "user", "content": prompt + prompt_info}]
-            )
-            summary = summary.choices[0].message.content.strip()
-            return summary
-
-        elif isinstance(self.model, MistralModel):
-            return "Mistral model"
+        summary = await self.client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt + prompt_info}]
+        )
+        summary = summary.choices[0].message.content.strip()
+        return summary
 
     async def finetune_text_model(self, model_query: str, data_query: str, data: str, interactive: bool = False):
         """Finetune a text model with the given data."""
@@ -269,16 +311,33 @@ class SmithModel:
                 }
             )
             self.model.ft_id = ft_job.id
+        elif isinstance(self.model, MistralModel):
+            self.system_prompt = data.prompts[0].system_prompt
+            print("System prompt:", self.system_prompt)
+            print("Creating Mistral files...")
+            file = await self.model.create_file(str(data))
+
+            print("Fine-tuning model...")
+            ft_job = await self.model.client.fine_tuning.jobs.create_async(
+                training_files=[{"file_id": file.id, "weight": 1}],
+                model=self.model.name,
+                hyperparameters={
+                    "n_epochs": 7,
+                }
+            )
+
+            self.model.ft_id = ft_job.id
 
         while True:
-            ft_job: FineTuningJob = await self.get_finetune_status()
+            ft_status = await self.get_finetune_status()
+            ft_name = await self.get_finetune_name()
             print(await self.summarize())
-            if ft_job.status == "succeeded":
+            if ft_status == Status.SUCCEEDED:
                 self.complete = True
-                self.model.ft_name = ft_job.fine_tuned_model
+                self.model.ft_name = ft_name
                 print(self.model.ft_name)
                 break
-            elif ft_job.status == "failed":
+            elif ft_status == Status.FAILED:
                 self.complete = False
                 print("Fine-tuning failed.")
                 return
@@ -290,13 +349,43 @@ class SmithModel:
                 user_prompt = input("Enter a prompt: ")
                 print(await self.prompt(user_prompt))
 
-    async def get_finetune_status(self) -> FineTuningJob:
+    async def get_finetune_status(self) -> Optional[Status]:
         """Get the status of the current fine-tuning job."""
         if isinstance(self.model, GptModel):
             if self.model.ft_id is None:
                 return None
             ft_job: FineTuningJob = await self.model.client.fine_tuning.jobs.retrieve(self.model.ft_id)
-            return ft_job
+            if ft_job is None:
+                return None
+            elif ft_job.status == "succeeded":
+                return Status.SUCCEEDED
+            elif ft_job.status == "failed":
+                return Status.FAILED
+            else:
+                return Status.PENDING
+        elif isinstance(self.model, MistralModel):
+            if self.model.ft_id is None:
+                return None
+            ft_job = await self.model.client.fine_tuning.jobs.get_async(job_id=self.model.ft_id)
+            if ft_job is None:
+                return None
+            elif ft_job.status == "SUCCESS":
+                return Status.SUCCEEDED
+            elif ft_job.status == "FAILED" or ft_job.status == "FAILED_VALIDATION":
+                return Status.FAILED
+            else:
+                return Status.PENDING
+
+    async def get_finetune_name(self) -> Optional[str]:
+        """Get the name of the fine-tuned model."""
+        if self.model.ft_id is None:
+            return None
+
+        if isinstance(self.model, GptModel):
+            ft_job: FineTuningJob = await self.model.client.fine_tuning.jobs.retrieve(self.model.ft_id)
+        elif isinstance(self.model, MistralModel):
+            ft_job = await self.model.client.fine_tuning.jobs.get_async(job_id=self.model.ft_id)
+        return ft_job.fine_tuned_model
 
     async def prompt(self, prompt: str) -> str:
         """Generate a response to the given prompt."""
@@ -313,10 +402,18 @@ class SmithModel:
                 ],
                 temperature=0.1,
             ).choices[0].message.content
+        elif isinstance(self.model, MistralModel):
+            return await self.model.client.chat.complete_async(
+                model=self.model.ft_name,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+            )
     
 
 if __name__ == "__main__":
-    model = SmithModel("gpt")
+    model = SmithModel("mistral")
 
     model_query = "Create an LLM that mimics Sherlock from the Sherlock Holmes series"
     data_query = "Collect full transcripts of the Sherlock Holmes series, focusing on Sherlock's dialogue, deductions, and character development."

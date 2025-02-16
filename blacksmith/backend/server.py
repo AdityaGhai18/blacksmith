@@ -8,6 +8,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from openai import AsyncOpenAI
+
 app = FastAPI()
 
 origins = ["*"]
@@ -20,9 +22,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-stage: Literal["parsing", "scraping", "finetuning", "deploying", "not_ready"] = "not_ready"
+stage: Literal["parsing", "scraping", "finetuning", "deploying", "not_ready", "deployed"] = "not_ready"
 scraper = Scraper()
 model = SmithModel("gpt")
+ft_model = "ft:gpt-4o-mini-2024-07-18:monet::B1IBTo3q"
 
 @app.post("/request_model/")
 async def request_model(request: str):
@@ -34,8 +37,25 @@ async def request_model(request: str):
 
     return prompt.to_json()
 
+@app.post("/completions/")
+async def completions(request: str):
+    print(request)
+    print(model.system_prompt)
+    client = AsyncOpenAI()
+    if model.system_prompt is None:
+        model.system_prompt = "You are Sherlock Holmes."
+    response = await client.chat.completions.create(
+            model=ft_model,
+            messages=[
+                {"role": "system", "content": model.system_prompt},
+                {"role": "user", "content": request},
+            ])
+    return response.choices[0].message.content
+
+
 @app.get("/request_stage/")
 async def request_stage():
+    global ft_model
     if not scraper.complete: 
         stage = "scraping"
         summary = await scraper.state.summarize()
@@ -43,8 +63,9 @@ async def request_stage():
         stage = "finetuning"
         summary = await model.summarize()
     else:
-        stage = "deploying"
-        summary = "Deploying model..."
+        stage = "deployed"
+        summary = "Deployed with name: " + model.model.ft_name
+        ft_model = model.model.ft_name
     return {"stage": stage, "summary": summary}
 
 async def handle_model_request(request: str, prompt: Prompt):
