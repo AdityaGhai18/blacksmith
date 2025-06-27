@@ -9,6 +9,8 @@ Blacksmith makes this possible. Given the text prompt, it first figures out the 
 
 Once the model is fully trained, you have access to the API endpoint and the chatbot, making the world your oyster!
 
+Demo: [https://www.youtube.com/watch?v=d9Wftder1oU]
+
 ## How we built it
 How we built it To create an end-to-end process that transforms a simple user prompt into a fully functional ML model, we developed a sophisticated multi-agent workflow system operating in three distinct phases:
 
